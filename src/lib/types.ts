@@ -12,6 +12,38 @@ export interface VorbisOptions {
   maxMemoryMB?: number
   /** Enable detailed error reporting */
   verboseErrors?: boolean
+  /** Enable compression features (zlib integration) */
+  compressionSupport?: boolean
+  /** Enable lossless codec integration (FLAC support) */
+  losslessSupport?: boolean
+}
+
+export interface VorbisDependencyInfo {
+  /** zlib compression support available */
+  hasZlib: boolean
+  /** FLAC lossless codec support available */
+  hasFLAC: boolean
+  /** Static linking used (MAIN_MODULE) */
+  isStatic: boolean
+  /** Dynamic loading used (SIDE_MODULE) */
+  isDynamic: boolean
+  /** Dependency status bitmask */
+  statusMask: number
+}
+
+export interface VorbisCompressionResult {
+  /** Status of compression operation */
+  status: 'success' | 'no_compression' | 'error'
+  /** Compressed data */
+  data?: Uint8Array
+  /** Original size in bytes */
+  originalSize: number
+  /** Compressed size in bytes */
+  compressedSize: number
+  /** Compression ratio (originalSize / compressedSize) */
+  compressionRatio: number
+  /** Error message if status is 'error' */
+  error?: string
 }
 
 export interface VorbisInfo {

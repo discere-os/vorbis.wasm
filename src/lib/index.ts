@@ -19,7 +19,9 @@ import type {
   VorbisBenchmarkResult,
   VorbisFileInfo,
   VorbisLogLevel,
-  VorbisLogEntry
+  VorbisLogEntry,
+  VorbisDependencyInfo,
+  VorbisCompressionResult
 } from './types.ts'
 
 export default class Vorbis {
@@ -32,6 +34,8 @@ export default class Vorbis {
       simdOptimizations: true,
       maxMemoryMB: 256,
       verboseErrors: false,
+      compressionSupport: true,
+      losslessSupport: false,
       ...options
     }
   }
@@ -176,6 +180,45 @@ export default class Vorbis {
         this.log('warn', 'SIMD functions not available in this build')
       }
     }
+
+    // Dependency management functions - prefer static functions (MAIN_MODULE) over dynamic (SIDE_MODULE)
+    this.log('info', 'Binding dependency management functions...')
+    try {
+      // Try static dependency functions first (MAIN_MODULE)
+      this.log('info', 'Trying static dependency functions...')
+      this._vorbis_has_compression_static = this.module.cwrap('vorbis_has_compression_static', 'number', [])
+      this._vorbis_compress_packet_static = this.module.cwrap('vorbis_compress_packet_static', 'number', ['number', 'number', 'number', 'number'])
+      this._vorbis_decompress_packet_static = this.module.cwrap('vorbis_decompress_packet_static', 'number', ['number', 'number', 'number', 'number'])
+      this._vorbis_compression_bound_static = this.module.cwrap('vorbis_compression_bound_static', 'number', ['number'])
+      this._vorbis_benchmark_compression_static = this.module.cwrap('vorbis_benchmark_compression_static', 'number', ['number'])
+      this._vorbis_get_static_features = this.module.cwrap('vorbis_get_static_features', 'number', [])
+      this._vorbis_test_compression_ratio = this.module.cwrap('vorbis_test_compression_ratio', 'number', [])
+      this.log('info', 'Static dependency functions bound successfully')
+
+      // Test if static functions work
+      if (this._vorbis_has_compression_static) {
+        const hasCompression = this._vorbis_has_compression_static()
+        this.log('info', `Static compression availability: ${hasCompression}`)
+      }
+    } catch (staticError) {
+      this.log('info', `Static dependency functions failed: ${staticError}`)
+      // Fall back to dynamic dependency functions (SIDE_MODULE)
+      try {
+        this.log('info', 'Trying dynamic dependency functions...')
+        this._vorbis_has_zlib = this.module.cwrap('vorbis_has_zlib', 'number', [])
+        this._vorbis_has_flac = this.module.cwrap('vorbis_has_flac', 'number', [])
+        this._vorbis_get_dependency_status = this.module.cwrap('vorbis_get_dependency_status', 'number', [])
+        this._vorbis_compress_ogg_stream = this.module.cwrap('vorbis_compress_ogg_stream', 'number', ['number', 'number', 'number', 'number', 'number'])
+        this._vorbis_decompress_ogg_stream = this.module.cwrap('vorbis_decompress_ogg_stream', 'number', ['number', 'number', 'number', 'number'])
+        this._vorbis_compress_packet = this.module.cwrap('vorbis_compress_packet', 'number', ['number', 'number', 'number', 'number'])
+        this._vorbis_benchmark_compression = this.module.cwrap('vorbis_benchmark_compression', 'number', ['number'])
+        this._vorbis_cleanup_dependencies = this.module.cwrap('vorbis_cleanup_dependencies', 'void', [])
+        this.log('info', 'Dynamic dependency functions bound successfully')
+      } catch (dynamicError) {
+        this.log('warn', `Dynamic dependency functions failed: ${dynamicError}`)
+        this.log('info', 'Compression features not available in this build')
+      }
+    }
   }
 
   // Public API methods
@@ -271,8 +314,21 @@ export default class Vorbis {
     // Copy interleaved PCM data to analysis buffer
     for (let ch = 0; ch < channels; ch++) {
       const channelPtr = this.module.HEAP32[(bufferPtr + ch * 4) >> 2]
+
+      // Validate channel pointer
+      if (!channelPtr || channelPtr < 0) {
+        return { status: 'error', error: `Invalid channel pointer for channel ${ch}` }
+      }
+
+      const channelOffset = channelPtr >> 2
+
+      // Check if we have enough memory
+      if (channelOffset + samplesPerChannel > this.module.HEAPF32.length) {
+        return { status: 'error', error: `Buffer overflow: need ${samplesPerChannel} samples but only ${this.module.HEAPF32.length - channelOffset} available` }
+      }
+
       for (let i = 0; i < samplesPerChannel; i++) {
-        this.module.HEAPF32[(channelPtr >> 2) + i] = pcm[i * channels + ch]
+        this.module.HEAPF32[channelOffset + i] = pcm[i * channels + ch]
       }
     }
 
@@ -407,6 +463,199 @@ export default class Vorbis {
       simdUsed: true,
       memoryUsed: this.getMemoryUsage()
     }
+  }
+
+  /**
+   * Get dependency information
+   */
+  getDependencyInfo(): VorbisDependencyInfo {
+    this.ensureInitialized()
+
+    let hasZlib = false
+    let hasFLAC = false
+    let isStatic = false
+    let isDynamic = false
+    let statusMask = 0
+
+    // Check for dynamic dependencies (SIDE_MODULE)
+    if (this._vorbis_has_zlib && this._vorbis_has_flac) {
+      hasZlib = this._vorbis_has_zlib() === 1
+      hasFLAC = this._vorbis_has_flac() === 1
+      isDynamic = true
+      if (this._vorbis_get_dependency_status) {
+        statusMask = this._vorbis_get_dependency_status()
+      }
+    }
+
+    // Check for static dependencies (MAIN_MODULE)
+    if (this._vorbis_has_compression_static) {
+      hasZlib = this._vorbis_has_compression_static() === 1
+      isStatic = true
+      if (this._vorbis_get_static_features) {
+        statusMask = this._vorbis_get_static_features()
+      }
+    }
+
+    return {
+      hasZlib,
+      hasFLAC,
+      isStatic,
+      isDynamic,
+      statusMask
+    }
+  }
+
+  /**
+   * Compress Vorbis packet data (if compression available)
+   */
+  compressPacket(data: Uint8Array): VorbisCompressionResult {
+    this.ensureInitialized()
+
+    if (!this.options.compressionSupport) {
+      return {
+        status: 'no_compression',
+        originalSize: data.length,
+        compressedSize: data.length,
+        compressionRatio: 1.0,
+        error: 'Compression support disabled'
+      }
+    }
+
+    const originalSize = data.length
+    let compressedSize = 0
+    let compressionRatio = 1.0
+    let compressedData: Uint8Array | undefined
+
+    // Try dynamic compression first (SIDE_MODULE)
+    if (this._vorbis_compress_packet) {
+      const boundSize = Math.max(originalSize + 32, Math.floor(originalSize * 1.1))
+      const inputPtr = this.module._malloc(originalSize)
+      const outputPtr = this.module._malloc(boundSize)
+      const sizePtr = this.module._malloc(4)
+
+      this.module.HEAPU8.set(data, inputPtr)
+      this.module.HEAP32[sizePtr >> 2] = boundSize
+
+      const result = this._vorbis_compress_packet(inputPtr, originalSize, outputPtr, sizePtr)
+      compressedSize = this.module.HEAP32[sizePtr >> 2]
+
+      if (result === 0) {
+        compressedData = new Uint8Array(this.module.HEAPU8.buffer, outputPtr, compressedSize)
+        compressionRatio = originalSize / compressedSize
+      }
+
+      this.module._free(inputPtr)
+      this.module._free(outputPtr)
+      this.module._free(sizePtr)
+
+      if (result === 0) {
+        return {
+          status: 'success',
+          data: new Uint8Array(compressedData!),
+          originalSize,
+          compressedSize,
+          compressionRatio
+        }
+      }
+    }
+
+    // Try static compression (MAIN_MODULE)
+    if (this._vorbis_compress_packet_static) {
+      const boundSize = this._vorbis_compression_bound_static?.(originalSize) || Math.floor(originalSize * 1.1)
+      const inputPtr = this.module._malloc(originalSize)
+      const outputPtr = this.module._malloc(boundSize)
+      const sizePtr = this.module._malloc(4)
+
+      this.module.HEAPU8.set(data, inputPtr)
+      this.module.HEAP32[sizePtr >> 2] = boundSize
+
+      const result = this._vorbis_compress_packet_static(inputPtr, originalSize, outputPtr, sizePtr)
+      compressedSize = this.module.HEAP32[sizePtr >> 2]
+
+      if (result === 0) {
+        compressedData = new Uint8Array(this.module.HEAPU8.buffer, outputPtr, compressedSize)
+        compressionRatio = originalSize / compressedSize
+      }
+
+      this.module._free(inputPtr)
+      this.module._free(outputPtr)
+      this.module._free(sizePtr)
+
+      if (result === 0) {
+        return {
+          status: 'success',
+          data: new Uint8Array(compressedData!),
+          originalSize,
+          compressedSize,
+          compressionRatio
+        }
+      }
+    }
+
+    // No compression available
+    return {
+      status: 'no_compression',
+      originalSize,
+      compressedSize: originalSize,
+      compressionRatio: 1.0,
+      error: 'No compression library available'
+    }
+  }
+
+  /**
+   * Benchmark compression performance
+   */
+  benchmarkCompression(iterations: number = 1000): VorbisBenchmarkResult {
+    this.ensureInitialized()
+
+    let duration = -1
+    let operation = 'Compression (unavailable)'
+
+    // Try dynamic compression benchmark
+    if (this._vorbis_benchmark_compression) {
+      duration = this._vorbis_benchmark_compression(iterations)
+      operation = 'Dynamic Compression (SIDE_MODULE)'
+    }
+    // Try static compression benchmark
+    else if (this._vorbis_benchmark_compression_static) {
+      duration = this._vorbis_benchmark_compression_static(iterations)
+      operation = 'Static Compression (MAIN_MODULE)'
+    }
+
+    if (duration < 0) {
+      throw new Error('Compression benchmarking not available')
+    }
+
+    const opsPerSec = iterations / (duration / 1000)
+
+    return {
+      operation,
+      timeMs: duration,
+      opsPerSec,
+      simdUsed: false,
+      memoryUsed: this.getMemoryUsage()
+    }
+  }
+
+  /**
+   * Test compression ratio with real-world audio data
+   */
+  testCompressionRatio(): number {
+    this.ensureInitialized()
+
+    if (this._vorbis_test_compression_ratio) {
+      return this._vorbis_test_compression_ratio()
+    }
+
+    // Generate test pattern and compress manually
+    const testData = new Uint8Array(4096)
+    for (let i = 0; i < testData.length; i++) {
+      // Audio-like pattern with redundancy
+      testData[i] = Math.floor(128 + 100 * Math.sin(i * 0.1) + (i % 13))
+    }
+
+    const result = this.compressPacket(testData)
+    return result.compressionRatio
   }
 
   /**
@@ -558,6 +807,25 @@ export default class Vorbis {
   private _vorbis_dot_product_simd?: (a: number, b: number, n: number) => number
   private _vorbis_vector_add_simd?: (dest: number, src: number, n: number) => void
   private _vorbis_simd_benchmark?: (iterations: number) => number
+
+  // Dynamic dependency function bindings (SIDE_MODULE)
+  private _vorbis_has_zlib?: () => number
+  private _vorbis_has_flac?: () => number
+  private _vorbis_get_dependency_status?: () => number
+  private _vorbis_compress_ogg_stream?: (input: number, inputSize: number, output: number, outputSize: number, level: number) => number
+  private _vorbis_decompress_ogg_stream?: (input: number, inputSize: number, output: number, outputSize: number) => number
+  private _vorbis_compress_packet?: (packetData: number, packetSize: number, compressedData: number, compressedSize: number) => number
+  private _vorbis_benchmark_compression?: (iterations: number) => number
+  private _vorbis_cleanup_dependencies?: () => void
+
+  // Static dependency function bindings (MAIN_MODULE)
+  private _vorbis_has_compression_static?: () => number
+  private _vorbis_compress_packet_static?: (packetData: number, packetSize: number, compressedData: number, compressedSize: number) => number
+  private _vorbis_decompress_packet_static?: (compressedData: number, compressedSize: number, packetData: number, packetSize: number) => number
+  private _vorbis_compression_bound_static?: (sourceSize: number) => number
+  private _vorbis_benchmark_compression_static?: (iterations: number) => number
+  private _vorbis_get_static_features?: () => number
+  private _vorbis_test_compression_ratio?: () => number
 }
 
 // Export types
